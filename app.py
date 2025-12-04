@@ -5,9 +5,9 @@ import plotly.graph_objects as go
 import numpy as np
 from datetime import datetime, time, timedelta
 import io
-import os # <--- Добавили библиотеку для работы с файловой системой
+import os
 
-# --- 1. ГЛОБАЛЬНЫЕ НАСТРОЙКИ ИНТЕРФЕЙСА ---
+# --- 1. ГЛОБАЛЬНЫЕ НАСТРОЙКИ ---
 st.set_page_config(
     page_title="АСКУЭ Аналитика Pro", 
     layout="wide", 
@@ -15,264 +15,264 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# CSS
 st.markdown("""
     <style>
-        .block-container {padding-top: 1rem; padding-bottom: 2rem;}
-        div[data-testid="stMetricValue"] {font-size: 24px;}
+        .block-container {padding-top: 1rem; padding-bottom: 3rem;}
+        div[data-testid="stMetricValue"] {font-size: 22px;}
+        h3 {font-size: 20px !important;}
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. ЛОГИКА ПАРСИНГА ---
+# --- 2. ПАРСИНГ ---
 @st.cache_data
 def parse_askue_files(file_objects, selected_year):
-    # file_objects - это список BytesIO объектов (не важно, загружены они или считаны с диска)
     all_data = []
     
     for file_obj in file_objects:
-        # Декодируем байты в строку
         try:
             stringio = io.StringIO(file_obj.getvalue().decode("utf-8", errors='ignore'))
-        except Exception:
-            continue # Если файл битый
+        except: continue
 
         lines = stringio.readlines()
         file_date = None
         
-        # Поиск даты
         if len(lines) > 0:
             header = lines[0]
             if "30917" in header:
                 parts = header.split(":")
-                if len(parts) >= 2:
-                    date_code = parts[1]
-                    if len(date_code) == 4 and date_code.isdigit():
-                        try:
-                            file_date = datetime(selected_year, int(date_code[:2]), int(date_code[2:])).date()
-                        except: pass
+                if len(parts) >= 2 and len(parts[1]) == 4 and parts[1].isdigit():
+                    try:
+                        file_date = datetime(selected_year, int(parts[1][:2]), int(parts[1][2:])).date()
+                    except: pass
         
         if not file_date: continue
             
-        # Парсинг строк
         for line in lines:
             if line.startswith("(") and "):" in line:
                 parts = line.split(":")
-                full_code_raw = parts[0].replace("(", "").replace(")", "")
+                full_code = parts[0].replace("(", "").replace(")", "")
                 
-                if len(full_code_raw) >= 6:
-                    main_code = full_code_raw[:5]
-                    suffix = full_code_raw[-1]
+                if len(full_code) >= 6:
+                    main = full_code[:5]
+                    suf = full_code[-1]
                     
-                    if main_code in ["69347", "69339"] and suffix in ["1", "2", "3", "4"]:
+                    if main in ["69347", "69339"] and suf in ["1", "2", "3", "4"]:
                         type_map = {
-                            "1": "Актив Прием (kW)", "2": "Актив Отдача (kW)",
-                            "3": "Реактив Прием (kVar)", "4": "Реактив Отдача (kVar)"
+                            "1": "Актив Прием (кВт)", "2": "Актив Отдача (кВт)",
+                            "3": "Реактив Прием (кВАр)", "4": "Реактив Отдача (кВАр)"
                         }
-                        
                         if len(parts) >= 50:
                             for i in range(1, 49):
-                                try:
-                                    val = float(parts[i+1].replace(",", "."))
+                                try: val = float(parts[i+1].replace(",", "."))
                                 except: val = 0.0
                                 
-                                timestamp = datetime.combine(file_date, datetime.min.time()) + timedelta(minutes=i*30)
-                                
+                                ts = datetime.combine(file_date, datetime.min.time()) + timedelta(minutes=i*30)
                                 all_data.append({
-                                    "DateTime": timestamp,
-                                    "Date": file_date,
-                                    "Time": timestamp.time(),
-                                    "MeterID": main_code + "0",
-                                    "Type": type_map.get(suffix, "Unknown"),
-                                    "Suffix": int(suffix),
-                                    "Value": val
+                                    "DateTime": ts, "Date": file_date, "Time": ts.time(),
+                                    "MeterID": main + "0", "Type": type_map.get(suf, "?"),
+                                    "Suffix": int(suf), "Value": val
                                 })
 
     return pd.DataFrame(all_data) if all_data else pd.DataFrame()
 
-# --- 3. ФУНКЦИЯ ЧТЕНИЯ ИЗ ПАПКИ (ИСПРАВЛЕННАЯ) ---
+# --- 3. ЗАГРУЗКА ИЗ ПАПКИ ---
 def load_files_from_folder(folder_path):
-    collected_files = []
+    collected = []
     try:
-        # Проверяем, существует ли папка
         if os.path.isdir(folder_path):
-            # Перебираем файлы
-            for filename in os.listdir(folder_path):
-                if filename.lower().endswith(".txt"):
-                    filepath = os.path.join(folder_path, filename)
-                    # Читаем в бинарном режиме
-                    with open(filepath, "rb") as f:
-                        content = f.read()
-                        # Создаем объект BytesIO
-                        bytes_obj = io.BytesIO(content)
-                        # !!! ИСПРАВЛЕНИЕ: Передаем полный абсолютный путь, 
-                        # чтобы Streamlit мог корректно проверить файл для кэша
-                        bytes_obj.name = os.path.abspath(filepath) 
-                        collected_files.append(bytes_obj)
-            return collected_files, None
-        else:
-            return [], "Папка не найдена. Проверьте путь."
-    except Exception as e:
-        return [], str(e)
+            for fname in os.listdir(folder_path):
+                if fname.lower().endswith(".txt"):
+                    fpath = os.path.join(folder_path, fname)
+                    with open(fpath, "rb") as f:
+                        obj = io.BytesIO(f.read())
+                        obj.name = os.path.abspath(fpath)
+                        collected.append(obj)
+            return collected, None
+        return [], "Папка не найдена."
+    except Exception as e: return [], str(e)
 
-# --- 4. БОКОВАЯ ПАНЕЛЬ (НАСТРОЙКИ) ---
+# --- 4. ИНТЕРФЕЙС ---
 with st.sidebar:
-    st.header("⚙️ Панель управления")
+    st.header("⚙️ Управление")
     selected_year = st.number_input("Год данных", 2000, 2100, datetime.now().year)
     
-    # === ВАРИАНТ 1: ЗАГРУЗКА ФАЙЛОВ ===
-    st.subheader("📂 Загрузка данных")
-    
-    # Вкладки для методов загрузки
-    load_tab1, load_tab2 = st.tabs(["Файлы", "Папка"])
-    
-    final_file_list = [] # Сюда соберем файлы из обоих источников
-    
-    with load_tab1:
-        uploaded_files = st.file_uploader("Перетащите файлы сюда", accept_multiple_files=True, type="txt")
-        if uploaded_files:
-            final_file_list.extend(uploaded_files)
-            
-    with load_tab2:
-        folder_path = st.text_input("Путь к папке:", placeholder=r"C:\Данные\АСКУЭ")
-        st.caption("Скопируйте путь из адресной строки проводника и нажмите Enter.")
-        
-        # Кнопка для явной загрузки (хотя Enter тоже сработает)
-        if folder_path:
-            local_files, error_msg = load_files_from_folder(folder_path)
-            if error_msg:
-                st.error(error_msg)
-            elif local_files:
-                st.success(f"Найдено {len(local_files)} файлов .txt")
-                final_file_list.extend(local_files)
-            else:
-                st.warning("В папке нет файлов .txt")
+    tab_f1, tab_f2 = st.tabs(["Файлы", "Папка"])
+    final_files = []
+    with tab_f1:
+        upl = st.file_uploader("Загрузка файлов", accept_multiple_files=True, type="txt")
+        if upl: final_files.extend(upl)
+    with tab_f2:
+        fp = st.text_input("Путь к папке:")
+        if fp:
+            loc, err = load_files_from_folder(fp)
+            if err: st.error(err)
+            elif loc: 
+                st.success(f"Найдено {len(loc)} шт.")
+                final_files.extend(loc)
     
     st.divider()
-    
-    # Блок внешнего вида
-    st.subheader("🎨 Вид")
-    chart_height = st.slider("Высота графика (px)", 300, 1200, 600, 50)
-    line_width = st.slider("Толщина линий", 1, 5, 2)
-    show_markers = st.checkbox("Показывать точки", value=False)
-    
-    st.divider()
+    st.subheader("🎨 Настройки графика")
+    chart_h = st.slider("Высота", 300, 1200, 600, 50)
+    line_w = st.slider("Толщина линии", 1, 5, 2)
+    show_pts = st.checkbox("Показывать точки", False)
 
-# --- 5. ОСНОВНОЙ ЭКРАН ---
+# --- ОСНОВНОЙ КОД ---
 st.title("⚡ Энергомониторинг Dashboard")
 
-if final_file_list:
-    # Передаем combined список (и загруженные вручную, и из папки)
-    with st.spinner(f'Обработка {len(final_file_list)} файлов...'):
-        df = parse_askue_files(final_file_list, selected_year)
+if final_files:
+    with st.spinner(f'Обработка...'):
+        df = parse_askue_files(final_files, selected_year)
     
     if not df.empty:
-        # --- ФИЛЬТРЫ ---
-        with st.expander("🔎 Фильтрация данных", expanded=True):
-            col_f1, col_f2, col_f3 = st.columns([1, 1, 2])
-            with col_f1:
-                all_meters = sorted(df['MeterID'].unique())
-                sel_meters = st.multiselect("Точки учета:", all_meters, default=all_meters)
-            with col_f2:
-                all_types = sorted(df['Type'].unique())
-                sel_types = st.multiselect("Параметры:", all_types, default=["Актив Прием (kW)"])
-            with col_f3:
-                min_d, max_d = df['Date'].min(), df['Date'].max()
-                date_range = st.date_input("Период:", [min_d, max_d], min_value=min_d, max_value=max_d)
+        # Фильтры
+        with st.expander("🔎 Фильтры данных", expanded=True):
+            c1, c2, c3 = st.columns([1, 1, 2])
+            with c1: meters = st.multiselect("Точки учета:", sorted(df['MeterID'].unique()), default=sorted(df['MeterID'].unique()))
+            with c2: types = st.multiselect("Параметры:", sorted(df['Type'].unique()), default=["Актив Прием (кВт)"])
+            with c3: 
+                d_min, d_max = df['Date'].min(), df['Date'].max()
+                d_rng = st.date_input("Период:", [d_min, d_max], min_value=d_min, max_value=d_max)
 
         # Применение фильтров
-        if len(date_range) == 2:
-            mask = (df['MeterID'].isin(sel_meters)) & (df['Type'].isin(sel_types)) & \
-                   (df['Date'] >= date_range[0]) & (df['Date'] <= date_range[1])
-            df_view = df[mask]
+        if len(d_rng) == 2:
+            df_v = df[(df['MeterID'].isin(meters)) & (df['Type'].isin(types)) & (df['Date'] >= d_rng[0]) & (df['Date'] <= d_rng[1])]
         else:
-            df_view = df[df['MeterID'].isin(sel_meters) & df['Type'].isin(sel_types)]
+            df_v = df[(df['MeterID'].isin(meters)) & (df['Type'].isin(types))]
 
-        if df_view.empty:
-            st.warning("Нет данных для выбранных фильтров.")
+        if df_v.empty:
+            st.warning("Нет данных.")
         else:
             # --- KPI ---
-            st.markdown("### 📊 Ключевые показатели")
-            kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-            total_active = df_view[df_view['Type'].str.contains("Актив")]['Value'].sum()
-            max_peak = df_view['Value'].max()
-            peak_time = df_view.loc[df_view['Value'].idxmax()]['DateTime']
+            st.markdown("### 📊 Обзор за период")
+            k1, k2, k3, k4 = st.columns(4)
             
-            kpi1.metric("Всего (Актив)", f"{total_active:,.0f} кВт·ч".replace(",", " "))
-            kpi2.metric("Пик нагрузки", f"{max_peak:,.2f} кВт")
-            kpi3.metric("Время пика", peak_time.strftime('%d.%m %H:%M'))
-            kpi4.metric("Источников данных", f"{len(final_file_list)}") # Показываем кол-во файлов
+            act_sum = df_v[df_v['Type'].str.contains("Актив")]['Value'].sum()
+            react_sum = df_v[df_v['Type'].str.contains("Реактив")]['Value'].sum()
+            peak = df_v['Value'].max()
+            peak_t = df_v.loc[df_v['Value'].idxmax()]['DateTime']
+
+            k1.metric("Актив (Энергия)", f"{act_sum:,.0f} кВт·ч".replace(",", " "))
+            k2.metric("Реактив (Энергия)", f"{react_sum:,.0f} кВАр·ч".replace(",", " "))
+            k3.metric("Макс. Мощность", f"{peak:,.2f} кВт")
+            k4.metric("Время пика", peak_t.strftime('%d.%m %H:%M'))
             st.divider()
 
-            # --- ВКЛАДКИ ---
-            tab_main, tab_daily, tab_heat, tab_anal = st.tabs(["📈 Детальный график", "📅 Суточные", "🔥 Тепловая карта", "🧠 Анализ"])
+            t1, t2, t3, t4 = st.tabs(["📈 График", "📅 Сутки", "🔥 Карта", "🧠 Анализ"])
 
             # 1. ГРАФИК
-            with tab_main:
+            with t1:
                 fig = go.Figure()
-                for m_id in sel_meters:
-                    for t_type in sel_types:
-                        subset = df_view[(df_view['MeterID'] == m_id) & (df_view['Type'] == t_type)]
-                        if not subset.empty:
+                # Определяем подпись оси Y
+                has_kw = any("кВт" in t for t in types)
+                has_kvar = any("кВАр" in t for t in types)
+                if has_kw and not has_kvar: y_title = "Активная мощность (кВт)"
+                elif not has_kw and has_kvar: y_title = "Реактивная мощность (кВАр)"
+                else: y_title = "Мощность (кВт) / Реактив (кВАр)"
+
+                for m in meters:
+                    for t in types:
+                        sub = df_v[(df_v['MeterID'] == m) & (df_v['Type'] == t)]
+                        if not sub.empty:
                             fig.add_trace(go.Scatter(
-                                x=subset['DateTime'], y=subset['Value'],
-                                mode='lines+markers' if show_markers else 'lines',
-                                name=f"{m_id} - {t_type}",
-                                line=dict(width=line_width),
-                                hovertemplate='%{y:.2f} <br>%{x|%d.%m %H:%M}'
+                                x=sub['DateTime'], y=sub['Value'],
+                                mode='lines+markers' if show_pts else 'lines',
+                                name=f"{m} {t.split('(')[0]}", # Сокращаем имя в легенде
+                                line=dict(width=line_w),
+                                hovertemplate='<b>%{y:.2f}</b><br>%{x|%d.%m %H:%M}'
                             ))
                 fig.update_layout(
-                    height=chart_height, template="plotly_white",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                    margin=dict(l=20, r=20, t=50, b=20), hovermode="x unified",
-                    xaxis=dict(rangeslider=dict(visible=True), showgrid=True),
-                    yaxis=dict(showgrid=True, title="Мощность")
+                    height=chart_h, template="plotly_white",
+                    legend=dict(orientation="h", y=1.02, x=0),
+                    margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
+                    yaxis=dict(title=y_title, showgrid=True),
+                    xaxis=dict(title="Время / Дата", showgrid=True)
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
-            # 2. СУТОЧНЫЕ
-            with tab_daily:
-                daily_grp = df_view.groupby(['Date', 'Type', 'MeterID'])['Value'].sum().reset_index()
-                fig_bar = px.bar(daily_grp, x='Date', y='Value', color='Type', barmode='group', title="Потребление по дням")
-                fig_bar.update_layout(height=chart_height * 0.8, template="plotly_white")
-                st.plotly_chart(fig_bar, use_container_width=True)
+            # 2. СУТКИ
+            with t2:
+                d_g = df_v.groupby(['Date', 'Type', 'MeterID'])['Value'].sum().reset_index()
+                fig_b = px.bar(d_g, x='Date', y='Value', color='Type', barmode='group', title="Суточное потребление")
+                fig_b.update_layout(height=chart_h*0.8, template="plotly_white", yaxis_title="Энергия (кВт·ч / кВАр·ч)")
+                st.plotly_chart(fig_b, use_container_width=True)
 
-            # 3. HEATMAP
-            with tab_heat:
-                col_h1, col_h2 = st.columns(2)
-                with col_h1: hm_meter = st.selectbox("Точка:", all_meters)
-                with col_h2: hm_type = st.selectbox("Параметр:", all_types)
-                df_heat = df[(df['MeterID'] == hm_meter) & (df['Type'] == hm_type)].copy()
-                if not df_heat.empty:
-                    df_heat['TimeStr'] = df_heat['Time'].astype(str)
-                    df_heat['DateStr'] = df_heat['Date'].astype(str)
-                    fig_heat = px.density_heatmap(df_heat, x='DateStr', y='TimeStr', z='Value', nbinsy=48, color_continuous_scale='RdYlGn_r')
-                    fig_heat.update_layout(height=chart_height, yaxis=dict(autorange="reversed"), title=f"Карта: {hm_meter}")
-                    st.plotly_chart(fig_heat, use_container_width=True)
+            # 3. КАРТА
+            with t3:
+                c_h1, c_h2 = st.columns(2)
+                hm_m = c_h1.selectbox("Точка", meters)
+                hm_t = c_h2.selectbox("Параметр", types)
+                dh = df[(df['MeterID'] == hm_m) & (df['Type'] == hm_t)].copy()
+                if not dh.empty:
+                    dh['D'] = dh['Date'].astype(str)
+                    dh['T'] = dh['Time'].astype(str)
+                    fh = px.density_heatmap(dh, x='D', y='T', z='Value', nbinsy=48, color_continuous_scale='RdYlGn_r')
+                    fh.update_layout(height=chart_h, yaxis=dict(autorange="reversed", title="Часы"), xaxis_title="Дата", title=f"Нагрузка: {hm_m}")
+                    st.plotly_chart(fh, use_container_width=True)
 
-            # 4. АНАЛИЗ
-            with tab_anal:
+            # 4. АНАЛИЗ (НОВЫЙ)
+            with t4:
+                st.subheader("📊 Экспертный анализ режима потребления")
+                
+                # Подготовка данных (только активка для начала)
+                df_act = df[(df['MeterID'].isin(meters)) & (df['Suffix'] == 1)] # Актив Прием
+                
+                if not df_act.empty:
+                    # АНАЛИЗ 1: Коэффициент заполнения (Load Factor)
+                    # K = P_avg / P_max. Чем ближе к 1, тем ровнее график.
+                    avg_p = df_act['Value'].mean()
+                    max_p = df_act['Value'].max()
+                    load_factor = avg_p / max_p if max_p > 0 else 0
+                    
+                    c_a1, c_a2 = st.columns(2)
+                    with c_a1:
+                        st.markdown(f"**Коэффициент заполнения графика ($K_{{zap}}$):** `{load_factor:.2f}`")
+                        if load_factor > 0.7: st.success("✅ Отличный, ровный график нагрузки.")
+                        elif load_factor > 0.4: st.info("ℹ️ Средняя неравномерность (есть пики).")
+                        else: st.warning("⚠️ Очень неравномерный график! Высокие пики при малом потреблении.")
+                        st.caption("Показывает эффективность использования заявленной мощности.")
+
+                    # АНАЛИЗ 2: День / Ночь (08:00 - 20:00)
+                    day_start, day_end = time(8,0), time(20,0)
+                    mask_day = (df_act['Time'] >= day_start) & (df_act['Time'] < day_end)
+                    day_val = df_act[mask_day]['Value'].sum()
+                    night_val = df_act[~mask_day]['Value'].sum()
+                    total_val = day_val + night_val
+                    
+                    with c_a2:
+                        fig_pie = px.pie(names=['День (08-20)', 'Ночь (20-08)'], values=[day_val, night_val], 
+                                         title="Распределение День/Ночь", hole=0.4)
+                        fig_pie.update_layout(height=300, margin=dict(t=30, b=0, l=0, r=0))
+                        st.plotly_chart(fig_pie, use_container_width=True)
+
+                st.divider()
+                
+                # АНАЛИЗ 3: Качество (Cos Phi)
                 df_calc = df[df['Suffix'].isin([1, 3])].copy()
                 if not df_calc.empty:
-                    pivoted = df_calc.pivot_table(index=['DateTime', 'MeterID'], columns='Suffix', values='Value').reset_index()
-                    if 1 in pivoted.columns and 3 in pivoted.columns:
-                        pivoted['S'] = np.sqrt(pivoted[1]**2 + pivoted[3]**2)
-                        pivoted['CosPhi'] = np.where(pivoted['S'] > 0, pivoted[1] / pivoted['S'], 0)
-                        fig_cos = px.line(pivoted, x='DateTime', y='CosPhi', color='MeterID', title="Cos φ")
-                        fig_cos.add_hline(y=0.96, line_dash="dot", line_color="red")
-                        fig_cos.update_layout(height=chart_height * 0.8, yaxis_range=[0.6, 1.02], template="plotly_white")
+                    piv = df_calc.pivot_table(index=['DateTime', 'MeterID'], columns='Suffix', values='Value').reset_index()
+                    if 1 in piv.columns and 3 in piv.columns:
+                        piv['S'] = np.sqrt(piv[1]**2 + piv[3]**2)
+                        piv['CosPhi'] = np.where(piv['S'] > 0, piv[1] / piv['S'], 0)
+                        
+                        st.markdown("**📉 Анализ реактивной мощности (Cos φ)**")
+                        
+                        # График
+                        fig_cos = px.line(piv, x='DateTime', y='CosPhi', color='MeterID', title="Динамика Cos φ")
+                        fig_cos.add_hline(y=0.96, line_dash="dash", line_color="red", annotation_text="Норма 0.96")
+                        fig_cos.update_layout(height=400, yaxis_title="Cos φ", template="plotly_white", yaxis_range=[0.5, 1.05])
                         st.plotly_chart(fig_cos, use_container_width=True)
-                    else: st.warning("Нет данных Актив+Реактив.")
-
-    else:
-        st.error("В загруженных файлах не найдены нужные коды.")
+                        
+                        # Scatter Plot (Актив vs Реактив)
+                        st.markdown("**Зависимость Реактива от Актива** (Позволяет выявить характер нагрузки)")
+                        fig_scat = px.scatter(piv, x=1, y=3, color='MeterID', trendline="ols",
+                                              labels={ "1": "Активная (кВт)", "3": "Реактивная (кВАр)" })
+                        fig_scat.update_layout(height=500, template="plotly_white")
+                        st.plotly_chart(fig_scat, use_container_width=True)
+                        
+                    else:
+                        st.info("💡 Для расчета Cos φ нужны данные по Активной (код 1) и Реактивной (код 3) энергии.")
+                else:
+                    st.write("Загрузите файлы с данными по реактивной энергии для детального анализа качества.")
 
 else:
-    # LANDING PAGE
-    st.markdown("""
-    <div style='text-align: center; margin-top: 50px;'>
-        <h1>⚡ Энергомониторинг Dashboard</h1>
-        <p style='color: gray;'>
-            Укажите путь к папке или загрузите файлы вручную в меню слева.
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown("<h3 style='text-align: center; color: grey;'>📂 Загрузите данные для начала работы</h3>", unsafe_allow_html=True)
