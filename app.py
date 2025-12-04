@@ -6,40 +6,73 @@ import numpy as np
 from datetime import datetime, time, timedelta
 import io
 import os
+import google.generativeai as genai
 
-# --- 1. ГЛОБАЛЬНЫЕ НАСТРОЙКИ СТРАНИЦЫ ---
+# --- 1. ГЛОБАЛЬНЫЕ НАСТРОЙКИ ---
 st.set_page_config(
-    page_title="АСКУЭ Аналитика Pro", 
+    page_title="АСКУЭ Pro", 
     layout="wide", 
-    page_icon="⚡",
+    page_icon="🏭",
     initial_sidebar_state="expanded"
 )
 
-# CSS: Убираем лишние отступы и увеличиваем шрифт метрик
-st.markdown("""
-    <style>
-        .block-container {padding-top: 1rem; padding-bottom: 3rem;}
-        div[data-testid="stMetricValue"] {font-size: 22px;}
-        h3 {font-size: 20px !important;}
-    </style>
-""", unsafe_allow_html=True)
+# --- 2. УПРАВЛЕНИЕ СТИЛЯМИ (КРУПНЫЙ ШРИФТ) ---
+def apply_custom_css(font_scale):
+    """
+    font_scale: 1.0 (norm) or 1.25 (large)
+    """
+    base_size = 16 * font_scale
+    metric_size = 24 * font_scale
+    
+    st.markdown(f"""
+        <style>
+            /* Глобальный размер шрифта */
+            html, body, [class*="css"] {{
+                font-size: {base_size}px;
+            }}
+            /* Метрики */
+            div[data-testid="stMetricValue"] {{
+                font-size: {metric_size}px !important;
+                color: #0068c9;
+                font-weight: 600;
+            }}
+            /* Теги мультиселекта */
+            span[data-baseweb="tag"] {{
+                font-size: {14 * font_scale}px;
+            }}
+            /* Заголовки */
+            h1 {{ font-size: {32 * font_scale}px !important; }}
+            h2 {{ font-size: {26 * font_scale}px !important; }}
+            h3 {{ font-size: {22 * font_scale}px !important; }}
+            
+            .block-container {{padding-top: 1rem; padding-bottom: 3rem;}}
+        </style>
+    """, unsafe_allow_html=True)
 
-# --- 2. ЛОГИКА ПАРСИНГА ФАЙЛОВ ---
+# --- 3. ФОРМАТИРОВАНИЕ ЧИСЕЛ ---
+def fmt_num(val):
+    if pd.isna(val): return "-"
+    if val > 100:
+        s = "{:,.0f}".format(val)
+    else:
+        s = "{:,.2f}".format(val)
+    return s.replace(",", " ")
+
+# --- 4. ПАРСИНГ ---
 @st.cache_data
 def parse_askue_files(file_objects, selected_year):
     all_data = []
     
     for file_obj in file_objects:
         try:
-            # Декодируем байты в строку
-            stringio = io.StringIO(file_obj.getvalue().decode("utf-8", errors='ignore'))
+            content = file_obj.getvalue().decode("utf-8", errors='ignore')
+            stringio = io.StringIO(content)
         except Exception:
             continue
 
         lines = stringio.readlines()
         file_date = None
         
-        # Поиск даты в заголовке (формат 30917:MMDD)
         if len(lines) > 0:
             header = lines[0]
             if "30917" in header:
@@ -51,7 +84,6 @@ def parse_askue_files(file_objects, selected_year):
         
         if not file_date: continue
             
-        # Парсинг строк данных
         for line in lines:
             if line.startswith("(") and "):" in line:
                 parts = line.split(":")
@@ -59,15 +91,25 @@ def parse_askue_files(file_objects, selected_year):
                 
                 if len(full_code) >= 6:
                     main = full_code[:5]
-                    suf = full_code[-1]
+                    try: suf = int(full_code[-1])
+                    except: suf = 0
                     
-                    # Фильтр: коды 69347/69339 и каналы 1-4
-                    if main in ["69347", "69339"] and suf in ["1", "2", "3", "4"]:
-                        type_map = {
-                            "1": "Актив Прием (кВт)", "2": "Актив Отдача (кВт)",
-                            "3": "Реактив Прием (кВАр)", "4": "Реактив Отдача (кВАр)"
-                        }
-                        # Данные начинаются со 2-го элемента (индекс 2), 48 получесовок
+                    if main in ["69347", "69339"] and suf in [1, 2, 3, 4]:
+                        type_label = "?"
+                        unit = ""
+                        if suf == 2: 
+                            type_label = "Акт. Потр."
+                            unit = "кВт"
+                        elif suf == 4: 
+                            type_label = "Реакт. Потр."
+                            unit = "кВАр"
+                        elif suf == 1: 
+                            type_label = "Акт. Переток"
+                            unit = "кВт"
+                        elif suf == 3: 
+                            type_label = "Реакт. Переток"
+                            unit = "кВАр"
+
                         if len(parts) >= 50:
                             for i in range(1, 49):
                                 try: val = float(parts[i+1].replace(",", "."))
@@ -76,15 +118,32 @@ def parse_askue_files(file_objects, selected_year):
                                 ts = datetime.combine(file_date, datetime.min.time()) + timedelta(minutes=i*30)
                                 all_data.append({
                                     "DateTime": ts, "Date": file_date, "Time": ts.time(),
-                                    "MeterID": main + "0", 
-                                    "Type": type_map.get(suf, "?"),
-                                    "Suffix": int(suf), 
+                                    "MeterID": main, 
+                                    "Type": f"{type_label} ({unit})", 
+                                    "ShortType": type_label,
+                                    "Unit": unit,
+                                    "Suffix": suf, 
                                     "Value": val
                                 })
 
     return pd.DataFrame(all_data) if all_data else pd.DataFrame()
 
-# --- 3. ЗАГРУЗКА ИЗ ПАПКИ (С ИСПРАВЛЕНИЕМ КЭША) ---
+# --- 5. ИИ ФУНКЦИИ ---
+def get_ai_response(api_key, model_name, messages):
+    try:
+        genai.configure(api_key=api_key)
+        gemini_history = []
+        for msg in messages:
+            role = "user" if msg["role"] == "user" else "model"
+            gemini_history.append({"role": role, "parts": [msg["content"]]})
+            
+        model = genai.GenerativeModel(model_name)
+        response = model.generate_content(gemini_history)
+        return response.text
+    except Exception as e:
+        return f"⚠️ Ошибка API ({model_name}): {str(e)}"
+
+# --- 6. ЗАГРУЗКА ---
 def load_files_from_folder(folder_path):
     collected = []
     try:
@@ -94,242 +153,286 @@ def load_files_from_folder(folder_path):
                     fpath = os.path.join(folder_path, fname)
                     with open(fpath, "rb") as f:
                         obj = io.BytesIO(f.read())
-                        # ВАЖНО: Передаем абсолютный путь для корректного кэширования
                         obj.name = os.path.abspath(fpath)
                         collected.append(obj)
             return collected, None
-        return [], "Папка не найдена или путь указан неверно."
+        return [], "Папка не найдена."
     except Exception as e: return [], str(e)
 
-# --- 4. БОКОВАЯ ПАНЕЛЬ ---
+# --- 7. БОКОВАЯ ПАНЕЛЬ (НАСТРОЙКИ + ЧАТ) ---
 with st.sidebar:
-    st.header("⚙️ Управление")
-    selected_year = st.number_input("Год данных", 2000, 2100, datetime.now().year)
+    st.title("🎛️ Панель управления")
     
-    st.subheader("📂 Источник данных")
-    tab_f1, tab_f2 = st.tabs(["Файлы", "Папка"])
-    
-    final_files = []
-    
-    # Вкладка 1: Drag & Drop
-    with tab_f1:
-        upl = st.file_uploader("Перетащите файлы .txt", accept_multiple_files=True, type="txt")
-        if upl: final_files.extend(upl)
+    # 1. ВНЕШНИЙ ВИД
+    with st.expander("👁️ Вид и Шрифт", expanded=False):
+        font_mode = st.radio("Размер текста", ["Нормальный", "Крупный (для чтения)"])
+        font_scale = 1.25 if font_mode == "Крупный (для чтения)" else 1.0
+        apply_custom_css(font_scale)
         
-    # Вкладка 2: Путь к папке
-    with tab_f2:
-        fp = st.text_input("Путь к папке:", placeholder="C:\\Data\\Askue")
-        if fp:
-            loc, err = load_files_from_folder(fp)
-            if err: st.error(err)
-            elif loc: 
-                st.success(f"Найдено {len(loc)} шт.")
-                final_files.extend(loc)
+        chart_h = st.slider("Высота графика", 300, 1000, 500, 50)
+        line_w = st.slider("Толщина линий", 1, 4, 2)
+        show_pts = st.checkbox("Точки на графике", value=False)
     
-    st.divider()
+    # 2. ЗАГРУЗКА ДАННЫХ
+    with st.expander("📂 Загрузка данных", expanded=True):
+        selected_year = st.number_input("Год", 2000, 2100, datetime.now().year)
+        
+        tab_f1, tab_f2 = st.tabs(["Файлы", "Папка"])
+        final_files = []
+        with tab_f1:
+            upl = st.file_uploader("Файлы .txt", accept_multiple_files=True)
+            if upl: final_files.extend(upl)
+        with tab_f2:
+            fp = st.text_input("Путь:", placeholder="C:\\Data")
+            if fp:
+                loc, err = load_files_from_folder(fp)
+                if loc: final_files.extend(loc)
     
-    st.subheader("🎨 Вид графиков")
-    chart_h = st.slider("Высота (px)", 300, 1200, 600, 50, help="Растяните график по вертикали для детального просмотра")
-    line_w = st.slider("Толщина линий", 1, 5, 2)
-    show_pts = st.checkbox("Показывать точки на линии", False)
+    # 3. НАСТРОЙКИ ИИ
+    with st.expander("🤖 Настройки ИИ", expanded=False):
+        api_key_input = st.text_input("API Key", value="AIzaSyAQu0wQTLYAIIU5hpgQN0BUFuQrvApeUpk", type="password")
+        model_options = ["gemini-2.0-flash", "gemini-2.5-pro", "gemini-1.5-pro", "gemini-1.5-flash"]
+        model_name_input = st.selectbox("Модель", model_options, index=0)
 
-# --- 5. ОСНОВНОЙ ЭКРАН ---
-st.title("⚡ Энергомониторинг Dashboard")
+    st.divider()
+
+    # 4. ЧАТ С ИИ (ТЕПЕРЬ ВСЕГДА ЗДЕСЬ)
+    st.header("💬 Чат с помощником")
+    # Контейнер для чата в сайдбаре
+    chat_container = st.container()
+
+# --- 8. ОСНОВНОЙ ЭКРАН ---
+st.title("⚡ АСКУЭ Аналитика")
 
 if final_files:
-    with st.spinner(f'Обработка {len(final_files)} файлов...'):
-        df = parse_askue_files(final_files, selected_year)
+    df = parse_askue_files(final_files, selected_year)
     
     if not df.empty:
-        # --- БЛОК ФИЛЬТРОВ (Expandable) ---
+        # --- ФИЛЬТРЫ ---
         with st.expander("🔎 Фильтры данных", expanded=True):
             c1, c2, c3 = st.columns([1, 1, 2])
             with c1: 
                 meters = sorted(df['MeterID'].unique())
-                sel_meters = st.multiselect("Точки учета:", meters, default=meters)
+                sel_meters = st.multiselect("Счетчики", meters, default=meters)
             with c2: 
                 types = sorted(df['Type'].unique())
-                sel_types = st.multiselect("Параметры:", types, default=["Актив Прием (кВт)"])
+                def_t = [t for t in types if "Акт. Потр." in t] 
+                if not def_t: def_t = types
+                sel_types = st.multiselect("Каналы", types, default=def_t)
             with c3: 
                 d_min, d_max = df['Date'].min(), df['Date'].max()
-                d_rng = st.date_input("Период:", [d_min, d_max], min_value=d_min, max_value=d_max)
+                d_rng = st.date_input("Период", [d_min, d_max])
 
-        # Применение фильтров
+        # Подготовка данных
         if len(d_rng) == 2:
             df_v = df[(df['MeterID'].isin(sel_meters)) & (df['Type'].isin(sel_types)) & (df['Date'] >= d_rng[0]) & (df['Date'] <= d_rng[1])]
+            df_kpi = df[(df['MeterID'].isin(sel_meters)) & (df['Date'] >= d_rng[0]) & (df['Date'] <= d_rng[1])]
         else:
             df_v = df[(df['MeterID'].isin(sel_meters)) & (df['Type'].isin(sel_types))]
+            df_kpi = df[df['MeterID'].isin(sel_meters)]
 
         if df_v.empty:
-            st.warning("Нет данных для выбранных фильтров.")
+            st.warning("Нет данных для отображения.")
         else:
-            # --- KPI ПАНЕЛЬ ---
-            st.markdown("### 📊 Сводка за период")
-            k1, k2, k3, k4 = st.columns(4)
-            
-            act_sum = df_v[df_v['Type'].str.contains("Актив")]['Value'].sum()
-            react_sum = df_v[df_v['Type'].str.contains("Реактив")]['Value'].sum()
+            # --- РАСЧЕТ KPI ---
+            act_val = df_kpi[df_kpi['Suffix'] == 2]['Value'].sum()
+            react_val = df_kpi[df_kpi['Suffix'] == 4]['Value'].sum()
             peak = df_v['Value'].max()
-            peak_t = df_v.loc[df_v['Value'].idxmax()]['DateTime']
+            peak_t = df_v.loc[df_v['Value'].idxmax()]['DateTime'].strftime('%d.%m %H:%M') if peak > 0 else "-"
+            
+            avg_cos = 0
+            if act_val > 0:
+                avg_cos = act_val / np.sqrt(act_val**2 + react_val**2)
 
-            k1.metric("Актив (Энергия)", f"{act_sum:,.0f} кВт·ч".replace(",", " "))
-            k2.metric("Реактив (Энергия)", f"{react_sum:,.0f} кВАр·ч".replace(",", " "))
-            k3.metric("Пиковая мощность", f"{peak:,.2f} кВт")
-            k4.metric("Время пика", peak_t.strftime('%d.%m %H:%M'))
-            st.divider()
+            # --- ОТОБРАЖЕНИЕ KPI ---
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Потребление", f"{fmt_num(act_val)} кВт", help="Активная энергия")
+            k2.metric("Реактив", f"{fmt_num(react_val)} кВАр", help="Реактивная энергия")
+            k3.metric("Cos φ", f"{avg_cos:.3f}", delta=f"{avg_cos-0.96:.3f}", delta_color="normal")
+            k4.metric("Пик", f"{fmt_num(peak)} кВт", delta=f"в {peak_t}", delta_color="off")
+            
+            # --- ЛОГИКА ЧАТА (В САЙДБАРЕ) ---
+            with chat_container:
+                # Инициализация
+                if "messages" not in st.session_state:
+                    context_prompt = f"""
+                    Ты профессиональный энергоаудитор. 
+                    ТЕКУЩИЙ КОНТЕКСТ ДАННЫХ (пользователь смотрит на эти цифры):
+                    - Период: {d_rng}
+                    - Выбранные счетчики: {sel_meters}
+                    - Потребление Актив: {act_val:,.0f} кВт
+                    - Потребление Реактив: {react_val:,.0f} кВАр
+                    - Средний Cos Phi: {avg_cos:.3f} (Норма > 0.96)
+                    - Максимальный пик: {peak:.2f} кВт (в {peak_t})
+                    
+                    Отвечай кратко и по существу. Если пользователь спрашивает про график, объясни общие принципы.
+                    """
+                    st.session_state.messages = [
+                        {"role": "user", "content": context_prompt}, 
+                        {"role": "model", "content": "Я вижу ваши данные. Чем могу помочь?"}
+                    ]
+                
+                # Обновление контекста (если фильтры изменились, отправляем скрытое сообщение)
+                # (Для упрощения просто выводим историю, но в идеале нужно обновлять системный промпт)
+                
+                # Вывод сообщений (только видимых)
+                for msg in st.session_state.messages[2:]:
+                    with st.chat_message(msg["role"]):
+                        st.markdown(msg["content"])
 
-            # --- ВКЛАДКИ КОНТЕНТА ---
-            t1, t2, t3, t4 = st.tabs(["📈 График нагрузки", "📅 Суточные итоги", "🔥 Тепловая карта", "🧠 Умный анализ"])
+                # Ввод сообщения
+                if prompt := st.chat_input("Вопрос по данным...", key="sidebar_chat"):
+                    if not api_key_input:
+                        st.error("Нет API ключа!")
+                    else:
+                        st.session_state.messages.append({"role": "user", "content": prompt})
+                        with st.chat_message("user"):
+                            st.markdown(prompt)
 
-            # 1. ДЕТАЛЬНЫЙ ГРАФИК
+                        with st.chat_message("assistant"):
+                            with st.spinner("..."):
+                                response_text = get_ai_response(api_key_input, model_name_input, st.session_state.messages)
+                                st.markdown(response_text)
+                        
+                        st.session_state.messages.append({"role": "assistant", "content": response_text})
+
+                if st.button("🧹 Очистить чат"):
+                    del st.session_state.messages
+                    st.rerun()
+
+            # --- ГЛАВНЫЕ ВКЛАДКИ ---
+            t1, t2, t3, t4 = st.tabs(["📈 Нагрузка", "📅 Итоги", "🔥 Матрица", "🎯 Характер нагрузки (P vs Q)"])
+
+            # 1. ГРАФИК НАГРУЗКИ
             with t1:
                 fig = go.Figure()
-                # Умный заголовок оси Y
-                has_kw = any("кВт" in t for t in sel_types)
-                has_kvar = any("кВАр" in t for t in sel_types)
-                if has_kw and not has_kvar: y_title = "Активная мощность (кВт)"
-                elif not has_kw and has_kvar: y_title = "Реактивная мощность (кВАр)"
-                else: y_title = "Мощность (кВт) / Реактив (кВАр)"
-
+                y_units = set()
                 for m in sel_meters:
                     for t in sel_types:
                         sub = df_v[(df_v['MeterID'] == m) & (df_v['Type'] == t)]
                         if not sub.empty:
+                            unit = sub['Unit'].iloc[0] if 'Unit' in sub.columns else ""
+                            y_units.add(unit)
+                            mode_val = 'lines+markers' if show_pts else 'lines'
                             fig.add_trace(go.Scatter(
                                 x=sub['DateTime'], y=sub['Value'],
-                                mode='lines+markers' if show_pts else 'lines',
-                                name=f"{m} {t.split('(')[0]}", # Короткое имя в легенде
-                                line=dict(width=line_w),
-                                hovertemplate='<b>%{y:.2f}</b><br>%{x|%d.%m %H:%M}'
+                                mode=mode_val,
+                                name=f"{m} {t}", 
+                                line=dict(width=line_w)
                             ))
                 
+                y_title = " / ".join(list(y_units)) if y_units else "Значение"
                 fig.update_layout(
-                    height=chart_h, # Регулируемая высота
-                    template="plotly_white", # Чистый белый стиль
-                    legend=dict(orientation="h", y=1.02, x=0), # Легенда сверху
-                    margin=dict(l=10, r=10, t=30, b=10), 
-                    hovermode="x unified",
-                    yaxis=dict(title=y_title, showgrid=True),
-                    xaxis=dict(title="Время", showgrid=True, rangeslider=dict(visible=True))
+                    height=chart_h, 
+                    template="plotly_white", 
+                    hovermode="x unified", 
+                    legend=dict(orientation="h", y=1.02),
+                    yaxis_title=f"Мощность ({y_title})",
+                    xaxis_title="Время"
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
             # 2. СУТОЧНЫЕ ИТОГИ
             with t2:
-                d_g = df_v.groupby(['Date', 'Type', 'MeterID'])['Value'].sum().reset_index()
-                fig_b = px.bar(d_g, x='Date', y='Value', color='Type', barmode='group', title="Суточное потребление")
+                d_g = df_v.groupby(['Date', 'Type'])['Value'].sum().reset_index()
+                fig_b = px.bar(d_g, x='Date', y='Value', color='Type', barmode='group')
                 fig_b.update_layout(
-                    height=chart_h * 0.8, 
-                    template="plotly_white", 
-                    yaxis_title="Энергия (кВт·ч / кВАр·ч)",
-                    legend=dict(orientation="h", y=1.02, x=0)
+                    height=chart_h, 
+                    template="plotly_white",
+                    yaxis_title="Энергия (кВт*ч / кВАр*ч)"
                 )
                 st.plotly_chart(fig_b, use_container_width=True)
 
-            # 3. ТЕПЛОВАЯ КАРТА (УЛУЧШЕННАЯ)
+            # 3. ТЕПЛОВАЯ КАРТА
             with t3:
-                c_h1, c_h2, c_h3 = st.columns([1, 1, 1])
-                with c_h1: hm_m = st.selectbox("Точка учета:", meters, key="hm_meter")
-                with c_h2: hm_t = st.selectbox("Параметр:", types, key="hm_type")
-                with c_h3: show_vals = st.checkbox("Показать значения (кВт)", value=False)
+                hm_cols = st.columns([1, 1, 2])
+                with hm_cols[0]: 
+                    show_vals = st.checkbox("Показать цифры", value=False)
 
-                dh = df[(df['MeterID'] == hm_m) & (df['Type'] == hm_t)].copy()
+                hm_m = sel_meters[0] if sel_meters else None
+                hm_t = next((t for t in sel_types if "Акт. Потр." in t), sel_types[0] if sel_types else None)
                 
-                if not dh.empty:
-                    # Подготовка матрицы
-                    dh['TimeStr'] = dh['Time'].apply(lambda x: x.strftime('%H:%M'))
-                    dh['DateStr'] = dh['Date'].apply(lambda x: x.strftime('%d.%m'))
+                if hm_m and hm_t:
+                    dh = df[(df['MeterID'] == hm_m) & (df['Type'] == hm_t)].copy()
+                    if len(d_rng) == 2: dh = dh[(dh['Date'] >= d_rng[0]) & (dh['Date'] <= d_rng[1])]
                     
-                    pivot_data = dh.pivot_table(index='TimeStr', columns='DateStr', values='Value', aggfunc='sum')
-                    
-                    # Сортировка времени
-                    pivot_data.index = pd.to_datetime(pivot_data.index, format='%H:%M').time
-                    pivot_data.sort_index(inplace=True)
-                    pivot_data.index = [t.strftime('%H:%M') for t in pivot_data.index]
+                    if not dh.empty:
+                        dh['TimeStr'] = dh['Time'].apply(lambda x: x.strftime('%H:%M'))
+                        dh['DateStr'] = dh['Date'].apply(lambda x: x.strftime('%d.%m'))
+                        p_hm = dh.pivot_table(index='TimeStr', columns='DateStr', values='Value', aggfunc='sum')
+                        p_hm.index = pd.to_datetime(p_hm.index, format='%H:%M').time
+                        p_hm.sort_index(inplace=True)
+                        p_hm.index = [t.strftime('%H:%M') for t in p_hm.index]
 
-                    fig_h = px.imshow(
-                        pivot_data,
-                        labels=dict(x="Дата", y="Время", color="Значение"),
-                        x=pivot_data.columns,
-                        y=pivot_data.index,
-                        aspect="auto",
-                        color_continuous_scale='RdYlGn_r',
-                        text_auto='.0f' if show_vals else False
-                    )
+                        fig_h = px.imshow(
+                            p_hm, aspect="auto", color_continuous_scale='RdYlGn_r', 
+                            title=f"Тепловая карта: {hm_m} ({hm_t})",
+                            text_auto='.0f' if show_vals else False 
+                        )
+                        fig_h.update_layout(height=max(600, chart_h))
+                        st.plotly_chart(fig_h, use_container_width=True)
 
-                    fig_h.update_layout(
-                        height=chart_h if not show_vals else max(800, chart_h),
-                        title=f"Матрица нагрузок: {hm_m} ({hm_t})",
-                        xaxis_nticks=30
-                    )
-                    fig_h.update_xaxes(side="top") # Даты сверху
-                    st.plotly_chart(fig_h, use_container_width=True)
-                else:
-                    st.warning("Нет данных для отображения карты.")
-
-            # 4. УМНЫЙ АНАЛИЗ
+            # 4. ХАРАКТЕР НАГРУЗКИ (ОТДЕЛЬНАЯ ВКЛАДКА)
             with t4:
-                st.subheader("📊 Анализ эффективности энергопотребления")
+                st.subheader("Диаграмма рассеяния: Активная (P) vs Реактивная (Q) мощность")
                 
-                # Работаем с активной энергией
-                df_act = df[(df['MeterID'].isin(sel_meters)) & (df['Suffix'] == 1)] # Актив Прием
+                df_c = df[df['MeterID'].isin(sel_meters) & (df['Suffix'].isin([2, 4]))].copy()
+                if len(d_rng) == 2: df_c = df_c[(df_c['Date'] >= d_rng[0]) & (df_c['Date'] <= d_rng[1])]
                 
-                if not df_act.empty:
-                    c_a1, c_a2 = st.columns(2)
+                if not df_c.empty:
+                    piv = df_c.pivot_table(index=['DateTime', 'MeterID'], columns='Suffix', values='Value').reset_index()
                     
-                    # Метрика: Коэффициент заполнения
-                    avg_p = df_act['Value'].mean()
-                    max_p = df_act['Value'].max()
-                    k_zap = avg_p / max_p if max_p > 0 else 0
-                    
-                    with c_a1:
-                        st.markdown(f"""
-                        **Коэффициент заполнения графика ($K_{{zap}}$):** `{k_zap:.2f}`
+                    if 2 in piv.columns and 4 in piv.columns:
+                        # Используем контрастную цветовую схему
+                        fig_s = px.scatter(
+                            piv, x=2, y=4, color='MeterID', opacity=0.7,
+                            labels={'2': 'Актив P (кВт)', '4': 'Реактив Q (кВАр)'},
+                            # Явная палитра: Красный, Синий, Зеленый, Оранжевый, Фиолетовый
+                            color_discrete_sequence=["#FF0000", "#0000FF", "#008000", "#FFA500", "#800080"]
+                        )
+                        
+                        # Линия тренда
+                        try:
+                            x = piv[2].fillna(0); y = piv[4].fillna(0)
+                            if len(x)>1: 
+                                k = np.sum(x*y)/np.sum(x**2)
+                                x_r = np.linspace(x.min(), x.max(), 10)
+                                fig_s.add_trace(go.Scatter(x=x_r, y=k*x_r, mode='lines', 
+                                                           line=dict(color='black', dash='dash', width=2), 
+                                                           name='Ваш средний Cos φ'))
+                        except: pass
+                        
+                        # Идеал
+                        max_x = piv[2].max()
+                        fig_s.add_trace(go.Scatter(x=[0, max_x], y=[0, max_x*0.29], mode='lines', 
+                                                   line=dict(color='green', width=3), 
+                                                   name='Идеал (Cos φ 0.96)'))
+
+                        fig_s.update_layout(
+                            height=600, 
+                            template="plotly_white", 
+                            xaxis_title="Активная мощность (кВт)",
+                            yaxis_title="Реактивная мощность (кВАр)",
+                            legend=dict(orientation="h", y=1.02)
+                        )
+                        st.plotly_chart(fig_s, use_container_width=True)
+                        
+                        # ВОССТАНОВЛЕННОЕ ОПИСАНИЕ
+                        st.info("""
+                        ### 📖 Как интерпретировать этот график?
+                        Этот график показывает "качество" вашего потребления в каждый момент времени (каждая точка = 30 мин).
+                        
+                        1.  **Ось X (Низ)**: Полезная нагрузка (кВт). Чем правее точка, тем больше работало оборудования.
+                        2.  **Ось Y (Лево)**: Бесполезная нагрузка (кВАр). Чем выше точка, тем больше потерь в сети.
+                        3.  **Зеленая линия (Идеал)**: Это граница Cos φ = 0.96.
+                            *   Точки **ниже** зеленой линии — **Отлично**. Вы работаете эффективно.
+                            *   Точки **выше** зеленой линии — **Плохо**. В эти моменты вы переплачиваете за реактив.
+                        4.  **Цвета точек**: Разные цвета соответствуют разным счетчикам (если выбрано несколько).
+                        
+                        **Совет:** Если массив точек постоянно выше зеленой линии, вам нужна конденсаторная установка (КРМ).
                         """)
-                        if k_zap > 0.7: st.success("✅ График ровный (эффективное потребление).")
-                        elif k_zap > 0.4: st.info("ℹ️ Средняя неравномерность.")
-                        else: st.warning("⚠️ Высокая неравномерность (пиковые нагрузки).")
-
-                    # Метрика: День / Ночь
-                    day_start, day_end = time(8,0), time(20,0)
-                    mask_day = (df_act['Time'] >= day_start) & (df_act['Time'] < day_end)
-                    v_day = df_act[mask_day]['Value'].sum()
-                    v_night = df_act[~mask_day]['Value'].sum()
-                    
-                    with c_a2:
-                        fig_pie = px.pie(values=[v_day, v_night], names=['День (08-20)', 'Ночь (20-08)'], hole=0.4, title="Распределение по зонам суток")
-                        fig_pie.update_layout(height=300, margin=dict(t=30, b=0, l=0, r=0))
-                        st.plotly_chart(fig_pie, use_container_width=True)
-
-                st.divider()
-                
-                # Метрика: Cos Phi и Scatter
-                df_calc = df[df['Suffix'].isin([1, 3])].copy()
-                if not df_calc.empty:
-                    piv = df_calc.pivot_table(index=['DateTime', 'MeterID'], columns='Suffix', values='Value').reset_index()
-                    if 1 in piv.columns and 3 in piv.columns:
-                        piv['S'] = np.sqrt(piv[1]**2 + piv[3]**2)
-                        piv['CosPhi'] = np.where(piv['S'] > 0, piv[1] / piv['S'], 0)
-                        
-                        st.markdown("#### 📉 Реактивная мощность и Cos φ")
-                        
-                        fig_cos = px.line(piv, x='DateTime', y='CosPhi', color='MeterID', title="Динамика Cos φ")
-                        fig_cos.add_hline(y=0.96, line_dash="dash", line_color="red", annotation_text="Норма 0.96")
-                        fig_cos.update_layout(height=400, yaxis_title="Cos φ", template="plotly_white", yaxis_range=[0.5, 1.02])
-                        st.plotly_chart(fig_cos, use_container_width=True)
-                        
-                        st.markdown("**Характер нагрузки (Актив vs Реактив)**")
-                        fig_scat = px.scatter(piv, x=1, y=3, color='MeterID', trendline="ols",
-                                              labels={"1": "Актив (кВт)", "3": "Реактив (кВАр)"})
-                        fig_scat.update_layout(height=500, template="plotly_white")
-                        st.plotly_chart(fig_scat, use_container_width=True)
                     else:
-                        st.info("Для анализа качества нужны данные по активной и реактивной энергии.")
+                        st.warning("Для построения графика нужны данные по каналам 2 (Актив) и 4 (Реактив). Проверьте файлы.")
 
 else:
-    st.markdown("""
-    <div style='text-align: center; margin-top: 100px; color: #888;'>
-        <h1>👋 Добро пожаловать</h1>
-        <p>Загрузите файлы в меню слева (Drag & Drop) или укажите папку.</p>
-    </div>
-    """, unsafe_allow_html=True)
+    st.info("👈 Пожалуйста, загрузите файлы данных в меню слева.")
